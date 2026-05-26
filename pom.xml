@@ -42,6 +42,12 @@
             <artifactId>langchain4j-open-ai</artifactId>
             <version>${langchain4j.version}</version>
         </dependency>
+        <!-- LangChain4j 本地 Embedding 模型（免 API Key，中英双语） -->
+        <dependency>
+            <groupId>dev.langchain4j</groupId>
+            <artifactId>langchain4j-embeddings-bge-small-zh-q</artifactId>
+            <version>${langchain4j.version}</version>
+        </dependency>
 
 <!-- SQLite：存聊天记录 -->
         <dependency>

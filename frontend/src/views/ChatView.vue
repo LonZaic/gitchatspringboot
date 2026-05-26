@@ -43,15 +43,13 @@
               </div>
             </div>
 
-            <!-- Streaming: show raw text while streaming -->
-            <div v-if="msg.content && chatStore.streaming && !msg._html" class="msg-content-stream">{{ msg.content }}</div>
-            <!-- Rendered markdown when available -->
+            <!-- Rendered markdown (progressive during stream, final after done) -->
             <div v-if="msg._html" class="msg-content markdown-body" v-html="msg._html"></div>
 
-            <!-- After streaming done but html not rendered yet -->
-            <div v-if="msg.content && !chatStore.streaming && !msg._html" class="msg-content-stream">{{ msg.content }}</div>
+            <!-- Fallback: raw text when html not yet rendered -->
+            <div v-else-if="msg.content" class="msg-content-stream">{{ msg.content }}</div>
 
-            <!-- Cursor -->
+            <!-- Cursor when waiting for first token -->
             <span class="cursor" v-if="chatStore.streaming && !msg.content && msg.thoughts.length === 0">▊</span>
 
             <!-- Error -->
@@ -60,8 +58,8 @@
               {{ msg.error }}
             </div>
 
-            <!-- Evidence -->
-            <div class="evidence" v-if="msg.evidence && msg.thoughtDone">
+            <!-- Evidence (from separate SSE event) -->
+            <div class="evidence" v-if="msg.evidence && msg.thoughtDone && msg.content">
               <div class="evidence-header" @click="msg._showEvidence = !msg._showEvidence">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
                 参考文件
@@ -116,7 +114,6 @@ import { markedHighlight } from 'marked-highlight'
 import hljs from 'highlight.js'
 import 'highlight.js/styles/github.css'
 
-// Configure marked with highlight.js via marked-highlight extension
 marked.use(markedHighlight({
   langPrefix: 'hljs language-',
   highlight(code, lang) {
@@ -147,49 +144,17 @@ function parseEvidenceLinks(text) {
   return links
 }
 
-async function renderMessageHtml(msg) {
-  if (!msg.content || msg._html) return
-  try {
-    msg._html = await marked.parse(msg.content, { breaks: true })
-  } catch {
-    msg._html = null
-  }
-}
-
-// Scroll to bottom on new messages
-watch(() => chatStore.messages.length, async () => {
-  await nextTick()
-  if (messagesRef.value) {
-    messagesRef.value.scrollTop = messagesRef.value.scrollHeight
-  }
-}, { flush: 'post' })
-
-// Render markdown when streaming finishes
-watch(() => chatStore.streaming, async (streaming) => {
-  if (!streaming) {
-    for (const msg of chatStore.messages) {
-      if (msg.role === 'assistant' && msg.content && !msg._html) {
-        await renderMessageHtml(msg)
-      }
+// Scroll to bottom on new messages or content updates
+watch(
+  () => chatStore.messages.map(m => m.content + (m._html ? '1' : '0')).join('|'),
+  async () => {
+    await nextTick()
+    if (messagesRef.value) {
+      messagesRef.value.scrollTop = messagesRef.value.scrollHeight
     }
-  }
-})
-
-// Debounced render while content streams in
-let renderTimer = null
-watch(() => chatStore.messages.map(m => m.content).join(''), () => {
-  clearTimeout(renderTimer)
-  renderTimer = setTimeout(async () => {
-    const msgs = chatStore.messages
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      const msg = msgs[i]
-      if (msg.role === 'assistant' && msg.content && !msg._html && !chatStore.streaming) {
-        await renderMessageHtml(msg)
-        break
-      }
-    }
-  }, 500)
-}, { deep: true })
+  },
+  { flush: 'post' }
+)
 
 async function send() {
   const q = question.value.trim()
@@ -212,7 +177,6 @@ function ask(text) {
   position: relative;
 }
 
-/* Welcome */
 .welcome {
   flex: 1;
   display: flex;
@@ -223,9 +187,7 @@ function ask(text) {
   padding: 40px 20px;
 }
 
-.welcome-icon {
-  margin-bottom: 16px;
-}
+.welcome-icon { margin-bottom: 16px; }
 
 .welcome-title {
   font-size: 22px;
@@ -277,12 +239,10 @@ function ask(text) {
 .msg-row {
   display: flex;
   gap: 12px;
-  max-width: 680px;
+  max-width: 100%;
 }
 
-.msg-row.user {
-  justify-content: flex-end;
-}
+.msg-row.user { justify-content: flex-end; }
 
 .msg-avatar {
   width: 32px;
@@ -300,6 +260,7 @@ function ask(text) {
 .msg-body {
   flex: 1;
   max-width: 85%;
+  min-width: 0;
 }
 
 .msg-bubble {
@@ -308,6 +269,7 @@ function ask(text) {
   font-size: 15px;
   line-height: 1.6;
   word-wrap: break-word;
+  overflow-wrap: break-word;
 }
 
 .msg-row.user .msg-bubble {
@@ -326,39 +288,31 @@ function ask(text) {
 .msg-content-stream {
   white-space: pre-wrap;
   line-height: 1.7;
+  word-break: break-word;
 }
 
+/* Markdown body - rendered output */
 :deep(.markdown-body) {
   line-height: 1.7;
+  word-break: break-word;
 }
-:deep(.markdown-body p) {
-  margin: 8px 0;
-}
+:deep(.markdown-body p) { margin: 8px 0; }
 :deep(.markdown-body ul),
-:deep(.markdown-body ol) {
-  padding-left: 20px;
-  margin: 8px 0;
-}
+:deep(.markdown-body ol) { padding-left: 20px; margin: 8px 0; }
 :deep(.markdown-body h1),
 :deep(.markdown-body h2),
 :deep(.markdown-body h3),
-:deep(.markdown-body h4) {
-  margin: 16px 0 8px;
-  font-weight: 600;
-}
+:deep(.markdown-body h4) { margin: 16px 0 8px; font-weight: 600; }
 :deep(.markdown-body h1) { font-size: 1.3em; }
 :deep(.markdown-body h2) { font-size: 1.15em; }
 :deep(.markdown-body h3) { font-size: 1.05em; }
-:deep(.markdown-body a) {
-  color: #0071e3;
-  text-decoration: underline;
-}
+:deep(.markdown-body a) { color: #0071e3; text-decoration: underline; }
 :deep(.markdown-body code:not(pre code)) {
   background: #f0f0f2;
   padding: 2px 6px;
   border-radius: 4px;
   font-size: 13px;
-  font-family: 'SF Mono', Monaco, monospace;
+  font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
 }
 :deep(.markdown-body pre) {
   background: #f6f8fa;
@@ -373,7 +327,7 @@ function ask(text) {
 :deep(.markdown-body pre code) {
   background: none;
   padding: 0;
-  font-family: 'SF Mono', Monaco, monospace;
+  font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
 }
 :deep(.markdown-body table) {
   border-collapse: collapse;
@@ -387,10 +341,7 @@ function ask(text) {
   padding: 8px 12px;
   text-align: left;
 }
-:deep(.markdown-body th) {
-  background: #f6f8fa;
-  font-weight: 600;
-}
+:deep(.markdown-body th) { background: #f6f8fa; font-weight: 600; }
 :deep(.markdown-body blockquote) {
   border-left: 3px solid #0071e3;
   margin: 12px 0;
@@ -398,15 +349,15 @@ function ask(text) {
   color: #86868b;
   background: #f9f9fb;
 }
+:deep(.markdown-body img) { max-width: 100%; }
+:deep(.markdown-body hr) { border: none; border-top: 1px solid #e8e8ed; margin: 16px 0; }
 
+/* Cursor blink */
 .cursor {
   animation: blink 0.8s step-end infinite;
   color: #0071e3;
 }
-
-@keyframes blink {
-  50% { opacity: 0; }
-}
+@keyframes blink { 50% { opacity: 0; } }
 
 /* Thoughts */
 .thoughts {
@@ -414,7 +365,6 @@ function ask(text) {
   padding-bottom: 12px;
   border-bottom: 1px solid #f0f0f2;
 }
-
 .thought-item {
   display: flex;
   align-items: center;
@@ -423,7 +373,6 @@ function ask(text) {
   color: #86868b;
   padding: 3px 0;
 }
-
 .thought-dot {
   width: 5px;
   height: 5px;
@@ -432,7 +381,6 @@ function ask(text) {
   flex-shrink: 0;
   animation: thought-pulse 1.2s ease-in-out infinite;
 }
-
 @keyframes thought-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.3; }
@@ -457,7 +405,6 @@ function ask(text) {
   padding-top: 12px;
   border-top: 1px solid #f0f0f2;
 }
-
 .evidence-header {
   display: flex;
   align-items: center;
@@ -469,26 +416,15 @@ function ask(text) {
   padding: 4px 0;
   transition: color 0.15s ease;
 }
-
-.evidence-header:hover {
-  color: #1d1d1f;
-}
-
-.chevron {
-  transition: transform 0.2s ease;
-}
-
-.chevron.open {
-  transform: rotate(180deg);
-}
-
+.evidence-header:hover { color: #1d1d1f; }
+.chevron { transition: transform 0.2s ease; }
+.chevron.open { transform: rotate(180deg); }
 .evidence-body {
   margin-top: 8px;
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
 }
-
 .evidence-link {
   display: inline-block;
   padding: 4px 12px;
@@ -499,7 +435,6 @@ function ask(text) {
   font-weight: 500;
   transition: all 0.15s ease;
 }
-
 .evidence-link:hover {
   background: #0071e3;
   color: #ffffff;
@@ -516,7 +451,6 @@ function ask(text) {
   color: #86868b;
   font-size: 15px;
 }
-
 .go-analyze-btn {
   padding: 10px 24px;
   background: #0071e3;
@@ -526,7 +460,6 @@ function ask(text) {
   font-weight: 600;
   transition: all 0.2s ease;
 }
-
 .go-analyze-btn:hover {
   background: #0077ed;
   transform: translateY(-1px);
@@ -539,7 +472,6 @@ function ask(text) {
   position: sticky;
   bottom: 0;
 }
-
 .input-inner {
   display: flex;
   gap: 8px;
@@ -549,7 +481,6 @@ function ask(text) {
   box-shadow: 0 2px 12px rgba(0, 0, 0, 0.06);
   border: 1px solid rgba(0, 0, 0, 0.04);
 }
-
 .chat-input {
   flex: 1;
   border: none;
@@ -559,11 +490,7 @@ function ask(text) {
   padding: 8px 0;
   color: #1d1d1f;
 }
-
-.chat-input::placeholder {
-  color: #aeaeb2;
-}
-
+.chat-input::placeholder { color: #aeaeb2; }
 .send-btn {
   width: 38px;
   height: 38px;
@@ -577,22 +504,9 @@ function ask(text) {
   transition: all 0.2s ease;
   flex-shrink: 0;
 }
-
-.send-btn.active {
-  background: #0071e3;
-  color: #ffffff;
-}
-
-.send-btn.active:hover {
-  background: #0077ed;
-  transform: scale(1.05);
-}
-
-.send-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
+.send-btn.active { background: #0071e3; color: #ffffff; }
+.send-btn.active:hover { background: #0077ed; transform: scale(1.05); }
+.send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .spinner-sm {
   width: 16px;
   height: 16px;
@@ -601,8 +515,5 @@ function ask(text) {
   border-radius: 50%;
   animation: spin 0.7s linear infinite;
 }
-
-@keyframes spin {
-  to { transform: rotate(360deg); }
-}
+@keyframes spin { to { transform: rotate(360deg); } }
 </style>

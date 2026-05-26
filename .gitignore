@@ -9,3 +9,6 @@ Thumbs.db
 .settings/
 .project
 .classpath
+target/
+chat_history.db
+Proxy

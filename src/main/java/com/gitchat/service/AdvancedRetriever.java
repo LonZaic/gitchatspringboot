@@ -3,108 +3,80 @@ package com.gitchat.service;
 import com.gitchat.model.Document;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.model.embedding.EmbeddingModel;
-import dev.langchain4j.model.openai.OpenAiEmbeddingModel;
+import dev.langchain4j.model.embedding.onnx.bgesmallzhq.BgeSmallZhQuantizedEmbeddingModel;
 
-import java.time.Duration;
 import java.util.*;
 
 /**
- * 向量检索器 —— 用 LangChain4j 调 Embedding API + 纯 Java 余弦相似度搜索
- *
- * 原本依赖 FAISS Java 绑定（io.github.javpower:faiss-java），
- * 但该包未发布到 Maven Central，改用纯 Java 内存向量搜索。
+ * 向量检索器 —— 本地 AllMiniLML6V2 做 embedding + 余弦相似度搜索
  */
 public class AdvancedRetriever {
 
     private final EmbeddingModel embeddingModel;
 
-    // 内存向量存储：docIndex 的每个 entry 对应一个文档的 embedding 向量
     private final List<float[]> vectorStore = new ArrayList<>();
     private final List<Document> docList = new ArrayList<>();
     private final List<String> bm25Texts = new ArrayList<>();
-    private int vectorDimension = 0;
     private boolean initialized = false;
 
     public AdvancedRetriever() {
-        String apiKey = System.getenv().getOrDefault("OPENROUTER_API_KEY", "");
-        String baseUrl = System.getenv().getOrDefault(
-                "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1");
-
-        this.embeddingModel = OpenAiEmbeddingModel.builder()
-                .apiKey(apiKey)
-                .baseUrl(baseUrl)
-                .modelName("openai/text-embedding-3-small")
-                .timeout(Duration.ofSeconds(60))
-                .build();
+        this.embeddingModel = new BgeSmallZhQuantizedEmbeddingModel();
     }
 
-    /**
-     * 建向量库 —— 每个文档调用 Embedding API 转成向量，存入内存列表
-     */
     public void buildVectorStore(List<Document> documents) {
         vectorStore.clear();
         docList.clear();
         bm25Texts.clear();
+        initialized = false;
 
         System.out.println("[VectorStore] 开始: " + documents.size() + " 个文档");
 
         if (documents.isEmpty()) return;
 
-        // 第1步：取第一个文档确定向量维度
-        try {
-            String firstText = documents.get(0).getPageContent();
-            if (firstText.length() > 8000) firstText = firstText.substring(0, 8000);
-            Embedding firstEmb = embeddingModel.embed(firstText).content();
-            vectorDimension = firstEmb.vector().length;
-            System.out.println("[VectorStore] 向量维度: " + vectorDimension);
-        } catch (Exception e) {
-            System.err.println("[VectorStore] 无法获取向量维度: " + e.getMessage());
-            return;
-        }
-
-        // 第2步：逐个文档 embedding，存入内存
-        int count = 0;
         for (Document doc : documents) {
-            try {
-                String text = doc.getPageContent();
-                if (text == null || text.trim().isEmpty()) continue;
-                if (text.length() > 8000) text = text.substring(0, 8000);
-
-                float[] vector = embeddingModel.embed(text).content().vector();
-
-                vectorStore.add(vector);
-                docList.add(doc);
-                bm25Texts.add(doc.getPageContent());
-                count++;
-
-                if (count % 10 == 0)
-                    System.out.println("[VectorStore] " + count + "/" + documents.size());
-            } catch (Exception e) {
-                System.err.println("[VectorStore] 第" + count + "个文档失败: " + e.getMessage());
-            }
+            if (doc.getPageContent() == null || doc.getPageContent().trim().isEmpty()) continue;
+            docList.add(doc);
+            bm25Texts.add(doc.getPageContent());
         }
 
-        initialized = true;
-        System.out.println("[VectorStore] 完成: " + count + " 个向量");
+        int maxEmbed = Math.min(docList.size(), 1000);
+        try {
+            int count = 0;
+            for (int i = 0; i < maxEmbed; i++) {
+                Document doc = docList.get(i);
+                try {
+                    String text = doc.getPageContent();
+                    if (text.length() > 8000) text = text.substring(0, 8000);
+                    float[] vector = embeddingModel.embed(text).content().vector();
+                    vectorStore.add(vector);
+                    count++;
+                    if (count % 50 == 0)
+                        System.out.println("[VectorStore] " + count + "/" + maxEmbed);
+                } catch (Exception e) {
+                    System.err.println("[VectorStore] 第" + count + "个文档失败: " + e.getMessage());
+                }
+            }
+            initialized = !vectorStore.isEmpty();
+            System.out.println("[VectorStore] 完成: " + count + " 个向量 (维度="
+                    + (initialized ? vectorStore.get(0).length : 0)
+                    + "), BM25 覆盖 " + docList.size() + " 个文档");
+        } catch (Exception e) {
+            System.err.println("[VectorStore] Embedding 失败: " + e.getMessage());
+            initialized = false;
+        }
     }
 
-    /**
-     * 向量搜索 —— 用余弦相似度在内存中暴力搜索 topK
-     */
     public List<Document> similaritySearch(String query, int topK) {
-        if (!initialized || vectorStore.isEmpty()) return List.of();
+        if (!initialized || vectorStore.isEmpty()) return bm25OnlySearch(query, topK);
 
         try {
             String q = query.length() > 8000 ? query.substring(0, 8000) : query;
             float[] queryVec = embeddingModel.embed(q).content().vector();
 
-            // 计算所有向量的余弦相似度
             double[] similarities = new double[vectorStore.size()];
-            for (int i = 0; i < vectorStore.size(); i++) {
+            for (int i = 0; i < vectorStore.size(); i++)
                 similarities[i] = cosineSimilarity(queryVec, vectorStore.get(i));
-            }
 
-            // 取 topK 个最大相似度
             Integer[] indices = new Integer[vectorStore.size()];
             for (int i = 0; i < indices.length; i++) indices[i] = i;
             Arrays.sort(indices, (a, b) -> Double.compare(similarities[b], similarities[a]));
@@ -112,22 +84,18 @@ public class AdvancedRetriever {
             List<Document> results = new ArrayList<>();
             for (int i = 0; i < Math.min(topK, indices.length); i++) {
                 int idx = indices[i];
-                if (idx >= 0 && idx < docList.size()) {
+                if (idx >= 0 && idx < docList.size())
                     results.add(docList.get(idx));
-                }
             }
             return results;
         } catch (Exception e) {
             System.err.println("[VectorStore] 搜索失败: " + e.getMessage());
-            return List.of();
+            return bm25OnlySearch(query, topK);
         }
     }
 
-    /**
-     * 混合搜索：向量(60%) + BM25关键词(40%)
-     */
     public List<Document> ensembleSearch(String query, int topK) {
-        if (!initialized) return similaritySearch(query, topK);
+        if (!initialized || vectorStore.isEmpty()) return bm25OnlySearch(query, topK);
 
         List<Document> vecDocs = similaritySearch(query, topK * 2);
         Map<Integer, Double> vecScores = new LinkedHashMap<>();
@@ -160,9 +128,25 @@ public class AdvancedRetriever {
         return results;
     }
 
-    /**
-     * 余弦相似度
-     */
+    public boolean isReady() {
+        return !docList.isEmpty();
+    }
+
+    private List<Document> bm25OnlySearch(String query, int topK) {
+        Map<Integer, Double> scores = bm25Search(query, topK);
+        List<Document> results = new ArrayList<>();
+        for (int idx : scores.keySet()) {
+            if (results.size() >= topK) break;
+            if (idx >= 0 && idx < docList.size())
+                results.add(docList.get(idx));
+        }
+        if (results.isEmpty()) {
+            int n = Math.min(topK, docList.size());
+            results.addAll(docList.subList(0, n));
+        }
+        return results;
+    }
+
     private double cosineSimilarity(float[] a, float[] b) {
         double dot = 0, normA = 0, normB = 0;
         for (int i = 0; i < a.length; i++) {
@@ -174,9 +158,6 @@ public class AdvancedRetriever {
         return denom == 0 ? 0 : dot / denom;
     }
 
-    /**
-     * BM25 简化版关键词搜索
-     */
     private Map<Integer, Double> bm25Search(String query, int limit) {
         Map<Integer, Double> scores = new LinkedHashMap<>();
         String[] words = query.toLowerCase().split("[\\s,.!?;:，。！？；：]+");

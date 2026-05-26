@@ -19,7 +19,11 @@ import java.util.Map;
 @RequestMapping("/api")
 public class ChatController {
 
-    private final RagService ragService = new RagService();
+    private final RagService ragService;
+
+    public ChatController(RagService ragService) {
+        this.ragService = ragService;
+    }
 
     /**
      * POST /api/chat -- SSE 流式聊天

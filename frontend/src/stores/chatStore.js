@@ -1,5 +1,20 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
+import { marked } from 'marked'
+
+function buildPartialHtml(text) {
+  if (!text) return ''
+  try {
+    // Synchronous parse for rapid partial updates
+    // marked.parse() may return a Promise in some configs, so use parseInline as fallback
+    const html = marked.parse(text, { breaks: true })
+    // If it returns a Promise (async config), return raw text
+    if (html instanceof Promise) return null
+    return html
+  } catch {
+    return null
+  }
+}
 
 export const useChatStore = defineStore('chat', () => {
   const messages = ref([])
@@ -20,6 +35,8 @@ export const useChatStore = defineStore('chat', () => {
       thoughtDone: false,
       evidence: '',
       id: Date.now() + 1,
+      _html: null,
+      _showEvidence: false,
     }
     addMessage(assistantMsg)
     streaming.value = true
@@ -29,6 +46,37 @@ export const useChatStore = defineStore('chat', () => {
     let currentContent = ''
     let thoughtDone = false
     let evidenceText = ''
+
+    // Progressive rendering timer
+    let renderTimer = null
+    const msgIdx = messages.value.length - 1
+
+    function scheduleRender() {
+      clearTimeout(renderTimer)
+      renderTimer = setTimeout(() => {
+        if (currentContent && msgIdx < messages.value.length) {
+          const html = buildPartialHtml(currentContent)
+          if (html !== null) {
+            messages.value[msgIdx] = {
+              ...messages.value[msgIdx],
+              content: currentContent,
+              thoughts: [...currentThoughts],
+              thoughtDone,
+              evidence: evidenceText,
+              _html: html,
+            }
+          } else {
+            messages.value[msgIdx] = {
+              ...messages.value[msgIdx],
+              content: currentContent,
+              thoughts: [...currentThoughts],
+              thoughtDone,
+              evidence: evidenceText,
+            }
+          }
+        }
+      }, 200)
+    }
 
     try {
       const res = await fetch('/api/chat', {
@@ -50,14 +98,12 @@ export const useChatStore = defineStore('chat', () => {
         if (done) break
 
         buffer += decoder.decode(value, { stream: true })
-        // Split by double newline (SSE event separator)
         const events = buffer.split('\n\n')
         buffer = events.pop() || ''
 
         for (const event of events) {
           if (!event.trim()) continue
 
-          // Parse SSE: handle both "data:..." and "data: ..."
           for (const line of event.split('\n')) {
             const trimmed = line.trim()
             if (!trimmed.startsWith('data:')) continue
@@ -75,20 +121,19 @@ export const useChatStore = defineStore('chat', () => {
                   thoughtDone = true
                   break
                 case 'response':
-                  if (data.content.startsWith('\n\nEVIDENCE:')) {
-                    evidenceText += data.content
-                  } else {
-                    currentContent += data.content
-                  }
+                  currentContent += data.content
+                  scheduleRender()
+                  break
+                case 'evidence':
+                  evidenceText = data.content
                   break
                 case 'error':
                   throw new Error(data.content)
               }
-              // Update the assistant message reactively
-              const idx = messages.value.length - 1
-              if (idx >= 0) {
-                messages.value[idx] = {
-                  ...messages.value[idx],
+              // Update reactively (non-html fields)
+              if (msgIdx < messages.value.length && data.type !== 'response') {
+                messages.value[msgIdx] = {
+                  ...messages.value[msgIdx],
                   content: currentContent,
                   thoughts: [...currentThoughts],
                   thoughtDone,
@@ -96,19 +141,36 @@ export const useChatStore = defineStore('chat', () => {
                 }
               }
             } catch (e) {
-              if (e.message.startsWith('请求失败') || e.message.startsWith('权限不足') || e.message.includes('API')) {
+              if (e.message && (e.message.startsWith('请求失败') || e.message.includes('API') || e.message.startsWith('权限不足'))) {
                 throw e
               }
             }
           }
         }
       }
+
+      // Final render after stream completes
+      clearTimeout(renderTimer)
+      if (currentContent && msgIdx < messages.value.length) {
+        let finalHtml = null
+        try {
+          const result = marked.parse(currentContent, { breaks: true })
+          finalHtml = result instanceof Promise ? null : result
+        } catch { /* keep null */ }
+        messages.value[msgIdx] = {
+          ...messages.value[msgIdx],
+          content: currentContent,
+          thoughts: [...currentThoughts],
+          thoughtDone: true,
+          evidence: evidenceText,
+          _html: finalHtml,
+        }
+      }
     } catch (e) {
       error.value = e.message
-      const idx = messages.value.length - 1
-      if (idx >= 0) {
-        messages.value[idx] = {
-          ...messages.value[idx],
+      if (msgIdx < messages.value.length) {
+        messages.value[msgIdx] = {
+          ...messages.value[msgIdx],
           content: currentContent || '',
           thoughts: currentThoughts,
           thoughtDone: true,

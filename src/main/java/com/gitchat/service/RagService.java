@@ -1,13 +1,19 @@
 package com.gitchat.service;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.gitchat.model.Document;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.ChatMessage;
+import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
+import dev.langchain4j.memory.ChatMemory;
+import dev.langchain4j.memory.chat.MessageWindowChatMemory;
 import dev.langchain4j.model.StreamingResponseHandler;
 import dev.langchain4j.model.chat.StreamingChatLanguageModel;
 import dev.langchain4j.model.openai.OpenAiStreamingChatModel;
 import dev.langchain4j.model.output.Response;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.IOException;
@@ -16,15 +22,12 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.regex.*;
 
-/**
- * RAG 服务核心 - 相当于 Python 的 rag_service.py
- * 整个项目的"大脑"：处理文档 + 流式回答
- */
+@Service
 public class RagService {
 
-    // ── LangChain4j 流式聊天模型（★ 代替手写 OkHttp + SSE 解析）──
     private final StreamingChatLanguageModel chatModel;
     private final String modelName;
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     private List<Document> docChunks = new ArrayList<>();
     private String repoName = "";
@@ -32,21 +35,21 @@ public class RagService {
     private String repoOverviewText = "";
     private final Map<String, String> fullDocuments = new LinkedHashMap<>();
     private Map<String, Object> analysisStats = new LinkedHashMap<>();
-    private final List<Map<String, String>> chatHistory = new ArrayList<>();
 
-    private final AdvancedRetriever advancedRetriever = new AdvancedRetriever();
+    // LangChain4j ChatMemory — per-repo conversation memory
+    private final Map<String, ChatMemory> repoMemories = new ConcurrentHashMap<>();
+
+    private final AdvancedRetriever advancedRetriever;
     private final ChatHistoryStore historyStore = new ChatHistoryStore();
     private boolean useAdvancedRetrieval = false;
 
-    public RagService() {
-        String apiKey = System.getenv().getOrDefault("OPENROUTER_API_KEY", "");
-        String baseUrl = System.getenv().getOrDefault("OPENROUTER_BASE_URL",
-                "https://openrouter.ai/api/v1");
-        this.modelName = System.getenv().getOrDefault("MODEL_NAME",
-                "google/gemini-2.5-flash");
+    public RagService(
+            @Value("${openrouter.api-key}") String apiKey,
+            @Value("${openrouter.base-url}") String baseUrl,
+            @Value("${openrouter.model}") String modelName) {
+        this.modelName = modelName;
+        this.advancedRetriever = new AdvancedRetriever();
 
-        // ★ 用 LangChain4j 创建流式聊天模型
-        // 相当于 Python 的: ChatOpenAI(streaming=True, ...)
         this.chatModel = OpenAiStreamingChatModel.builder()
                 .apiKey(apiKey)
                 .baseUrl(baseUrl)
@@ -55,6 +58,11 @@ public class RagService {
                 .maxTokens(8192)
                 .timeout(Duration.ofSeconds(120))
                 .build();
+    }
+
+    private ChatMemory getMemory() {
+        return repoMemories.computeIfAbsent(repoSlug,
+                k -> MessageWindowChatMemory.withMaxMessages(20));
     }
 
     public void processDocuments(List<Document> documents, String repoName, String repoSlug) {
@@ -79,26 +87,25 @@ public class RagService {
                 .distinct().count();
         stats.put("unique_sources", (int) us);
         analysisStats = stats;
-        chatHistory.clear();
+        // Clear memory for this repo when re-analyzed
+        ChatMemory old = repoMemories.remove(this.repoSlug);
+        if (old != null) old.clear();
         historyStore.clearRepo(this.repoSlug);
         try {
             advancedRetriever.buildVectorStore(chunks);
             useAdvancedRetrieval = true;
         } catch (Exception e) {
+            System.err.println("[RAG] Vector store build failed, falling back to keyword: " + e.getMessage());
             useAdvancedRetrieval = false;
         }
     }
 
-    /**
-     * 流式回答 —— 通过 SseEmitter 把 AI 回答逐字推给前端
-     * 相当于 Python 的 async def stream_answer() + SSE yield
-     */
     public SseEmitter streamAnswer(String question) {
-        SseEmitter emitter = new SseEmitter(0L); // 0 = 不超时
+        SseEmitter emitter = new SseEmitter(0L);
         new Thread(() -> {
             try {
                 if (docChunks.isEmpty()) {
-                    emitter.send(SseEmitter.event().name("error").data("No data"));
+                    sendEvent(emitter, "error", "No data loaded. Please analyze a repository first.");
                     emitter.complete();
                     return;
                 }
@@ -111,31 +118,69 @@ public class RagService {
                         ? "https://github.com/OWNER/REPO/blob/HEAD/"
                         : "https://github.com/" + repoSlug + "/blob/HEAD/";
                 Map<String, List<String>> grouped = groupBySource(topChunks);
-                String fNames = hasFull ? String.join(", ", reqFiles) : "";
-                String sysPrompt = buildSystemTemplate(hasFull, baseUrl, fNames) + repoOverviewText;
-                String hist = formatHistory(8);
+
+                // Build RAG context
                 String ctx = buildContext(grouped, hasFull, reqFiles);
-                String prompt = sysPrompt + "\nHISTORY:\n" + hist
-                        + "\nQUESTION:\n" + question + "\nCONTEXT:\n" + ctx;
+
+                // Build system message with RAG context + markdown formatting instructions
+                String systemText = buildSystemPrompt(baseUrl, ctx);
+                SystemMessage sysMsg = new SystemMessage(systemText);
+
+                // Build message list: system + memory history + current question
+                ChatMemory memory = getMemory();
+                List<ChatMessage> messages = new ArrayList<>();
+                messages.add(sysMsg);
+                messages.addAll(memory.messages());
+                messages.add(new UserMessage(question));
+
+                // Emit thinking indicators
                 emitThought(emitter, question, topChunks, grouped);
-                String ans = callLLMStream(emitter, prompt);
+
+                // Stream the answer
+                String ans = callLLMStream(emitter, messages);
+
                 if (ans != null && !ans.isEmpty()) {
+                    // Save to LangChain4j memory
+                    memory.add(new UserMessage(question));
+                    memory.add(new AiMessage(ans));
+                    // Also persist to SQLite
                     historyStore.saveQaPair(repoSlug, question, ans);
-                    chatHistory.add(Map.of("role", "user", "content", question));
-                    chatHistory.add(Map.of("role", "assistant", "content", ans));
-                    if (chatHistory.size() > 40)
-                        chatHistory.subList(0, chatHistory.size() - 40).clear();
                 }
                 emitEvidence(emitter, baseUrl, grouped);
                 emitter.complete();
             } catch (Exception e) {
-                try { emitter.send(SseEmitter.event().name("error").data(
-                        e.getMessage() != null ? e.getMessage() : "unknown")); }
-                catch (Exception ignored) {}
+                try {
+                    sendEvent(emitter, "error",
+                            e.getMessage() != null ? e.getMessage() : "unknown error");
+                } catch (Exception ignored) {}
                 emitter.complete();
             }
         }).start();
         return emitter;
+    }
+
+    // ── Prompt building ──
+
+    private String buildSystemPrompt(String baseUrl, String context) {
+        return """
+            You are GitChat, an expert code analyst. Answer questions about the codebase using the provided context.
+
+            ## Formatting Rules
+            - Use Markdown for all responses: headings, lists, bold, italic, links.
+            - Wrap ALL code in fenced code blocks with the language tag: ```python, ```java, ```javascript, etc.
+            - Use inline `code` for identifiers, file names, and short symbols.
+            - Use blockquotes for quoting code or logs.
+            - Use tables when comparing options or listing items with attributes.
+            - Keep responses clear and well-structured — separate sections with headings.
+
+            ## Accuracy Rules
+            - Answer ONLY based on the provided context. Do NOT invent or guess.
+            - If the context doesn't contain enough information, say so clearly.
+            - When referencing files, use the format: [`filename`](%sPATH)
+
+            ## Context
+            %s
+            """.formatted(baseUrl, context);
     }
 
     private String buildRepoOverview(List<Document> docs, List<Document> chunks) {
@@ -145,15 +190,14 @@ public class RagService {
             String ext = "(no_ext)"; int dot = src.lastIndexOf('.'); if (dot >= 0) ext = src.substring(dot);
             extC.merge(ext, 1, Integer::sum);
         }
-        StringBuilder sb = new StringBuilder("Files: " + docs.size() + ", Chunks: " + chunks.size() + ", Types: ");
+        StringBuilder sb = new StringBuilder();
+        sb.append("- **Files**: ").append(docs.size()).append(", **Chunks**: ").append(chunks.size()).append("\n");
+        sb.append("- **Types**: ");
         extC.forEach((k, v) -> sb.append(k).append(":").append(v).append(" "));
         return sb.toString();
     }
 
-    private String buildSystemTemplate(boolean hasFull, String baseUrl, String fileNames) {
-        if (hasFull) return "SYSTEM: Output complete file for: " + fileNames;
-        return "SYSTEM: Answer based on context only. Do not invent. Reference: [name](" + baseUrl + "PATH)";
-    }
+    // ── File detection ──
 
     private List<String> detectRequestedFiles(String question) {
         List<String> req = new ArrayList<>();
@@ -195,6 +239,8 @@ public class RagService {
         return new ArrayList<>(new LinkedHashSet<>(req));
     }
 
+    // ── Context building ──
+
     private Map<String, List<String>> groupBySource(List<Document> chunks) {
         Map<String, List<String>> g = new LinkedHashMap<>();
         for (Document c : chunks)
@@ -204,73 +250,67 @@ public class RagService {
     }
 
     private String buildContext(Map<String, List<String>> grouped, boolean hasFull, List<String> reqFiles) {
-        StringBuilder ctx = new StringBuilder("=== SEARCH RESULTS ===\n");
+        StringBuilder ctx = new StringBuilder();
         int count = 0;
         for (var e : grouped.entrySet()) {
             if (count >= 12) break;
             String merged = String.join("\n\n", e.getValue());
-            if (merged.length() > 3200) merged = merged.substring(0, 3200);
-            ctx.append("[").append(e.getKey()).append("]\n").append(merged).append("\n\n---\n\n");
+            if (merged.length() > 3200) merged = merged.substring(0, 3200) + "\n... (truncated)";
+            ctx.append("### `").append(e.getKey()).append("`\n```\n").append(merged).append("\n```\n\n");
             count++;
         }
         if (hasFull) for (String fp : reqFiles) {
             String content = fullDocuments.get(fp);
             if (content != null) {
                 if (content.length() > 40000) content = content.substring(0, 40000);
-                ctx.append("[").append(fp).append(" FULL]\n```\n").append(content).append("\n```\n\n");
+                String lang = inferLang(fp);
+                ctx.append("### `").append(fp).append("` (full file)\n```").append(lang).append("\n")
+                  .append(content).append("\n```\n\n");
             }
         }
-        return ctx.length() > 0 ? ctx.toString() : "(no context)";
+        return ctx.length() > 0 ? ctx.toString() : "(no context available)";
     }
 
-    private void emitThought(SseEmitter emitter, String q, List<Document> top, Map<String, List<String>> grp) {
-        try {
-            Set<String> srcs = new LinkedHashSet<>();
-            for (Document c : top) srcs.add(c.getMetadata().getOrDefault("source","unknown"));
-            emitter.send(SseEmitter.event().data(jsonEvent("thought","Searching: "+qPreview(q))));
-            Thread.sleep(300);
-            emitter.send(SseEmitter.event().data(jsonEvent("thought","Found "+top.size()+" chunks")));
-            Thread.sleep(300);
-            emitter.send(SseEmitter.event().data(jsonEvent("thought","Covered "+srcs.size()+" files")));
-            Thread.sleep(300);
-            List<String> sl = new ArrayList<>(srcs);
-            if (!sl.isEmpty()) {
-                StringBuilder sb = new StringBuilder("Files: ");
-                for (int i = 0; i < Math.min(5,sl.size()); i++) {
-                    if (i>0) sb.append(", ");
-                    String s = sl.get(i); int slash = s.lastIndexOf('/');
-                    sb.append(slash>=0 ? s.substring(slash+1) : s);
-                }
-                emitter.send(SseEmitter.event().data(jsonEvent("thought",sb.toString())));
-            }
-            Thread.sleep(300);
-            emitter.send(SseEmitter.event().data("{\"type\":\"thought_done\"}"));
-        } catch (Exception e) { /* ignore */ }
+    private String inferLang(String path) {
+        String p = path.toLowerCase();
+        if (p.endsWith(".java")) return "java";
+        if (p.endsWith(".py")) return "python";
+        if (p.endsWith(".js")) return "javascript";
+        if (p.endsWith(".ts")) return "typescript";
+        if (p.endsWith(".jsx")) return "jsx";
+        if (p.endsWith(".tsx")) return "tsx";
+        if (p.endsWith(".vue")) return "vue";
+        if (p.endsWith(".go")) return "go";
+        if (p.endsWith(".rs")) return "rust";
+        if (p.endsWith(".kt")) return "kotlin";
+        if (p.endsWith(".c") || p.endsWith(".h")) return "c";
+        if (p.endsWith(".cpp") || p.endsWith(".hpp")) return "cpp";
+        if (p.endsWith(".sql")) return "sql";
+        if (p.endsWith(".sh")) return "bash";
+        if (p.endsWith(".yml") || p.endsWith(".yaml")) return "yaml";
+        if (p.endsWith(".json")) return "json";
+        if (p.endsWith(".xml")) return "xml";
+        if (p.endsWith(".md")) return "markdown";
+        if (p.endsWith(".css")) return "css";
+        if (p.endsWith(".scss")) return "scss";
+        if (p.endsWith(".html")) return "html";
+        if (p.endsWith(".properties")) return "properties";
+        return "";
     }
 
-    /**
-     * ★ 调用 LangChain4j 流式聊天模型
-     * 相当于 Python 的: async for chunk in llm.astream(prompt): yield chunk
-     *
-     * 以前手写版：150行（OkHttp请求 + SSE解析 + JSON拆包）
-     * 现在 LangChain4j：只需实现3个回调
-     *
-     * 注意：chatModel.generate() 是异步的（立即返回，回调异步触发）
-     * 所以用 CountDownLatch 等待所有字吐完再返回完整回答
-     */
-    private String callLLMStream(SseEmitter emitter, String prompt) {
+    // ── SSE streaming ──
+
+    private String callLLMStream(SseEmitter emitter, List<ChatMessage> messages) {
         StringBuilder fullAnswer = new StringBuilder();
         CountDownLatch latch = new CountDownLatch(1);
 
-        // ★ LangChain4j 流式调用（0.34.0 API：onNext/onComplete/onError）
-        chatModel.generate(List.of(new UserMessage(prompt)), new StreamingResponseHandler<AiMessage>() {
+        chatModel.generate(messages, new StreamingResponseHandler<AiMessage>() {
             @Override
             public void onNext(String token) {
                 fullAnswer.append(token);
                 try {
-                    emitter.send(SseEmitter.event()
-                            .data(jsonEvent("response", token)));
-                } catch (IOException ignored) {}
+                    sendEvent(emitter, "response", token);
+                } catch (Exception ignored) {}
             }
 
             @Override
@@ -282,9 +322,8 @@ public class RagService {
             public void onError(Throwable error) {
                 System.err.println("[LLM] Error: " + error.getMessage());
                 try {
-                    emitter.send(SseEmitter.event()
-                            .data(jsonEvent("error", error.getMessage())));
-                } catch (IOException ignored) {}
+                    sendEvent(emitter, "error", error.getMessage());
+                } catch (Exception ignored) {}
                 latch.countDown();
             }
         });
@@ -295,40 +334,65 @@ public class RagService {
         return fullAnswer.toString().trim();
     }
 
+    private void sendEvent(SseEmitter emitter, String type, String content) {
+        try {
+            Map<String, String> event = new LinkedHashMap<>();
+            event.put("type", type);
+            event.put("content", content);
+            String json = objectMapper.writeValueAsString(event);
+            emitter.send(SseEmitter.event().data(json));
+        } catch (IOException e) { /* connection closed, ignore */ }
+    }
+
+    // ── Thinking indicators ──
+
+    private void emitThought(SseEmitter emitter, String q, List<Document> top, Map<String, List<String>> grp) {
+        try {
+            Set<String> srcs = new LinkedHashSet<>();
+            for (Document c : top) srcs.add(c.getMetadata().getOrDefault("source","unknown"));
+            sendEvent(emitter, "thought", "Searching: " + qPreview(q));
+            Thread.sleep(200);
+            sendEvent(emitter, "thought", "Found " + top.size() + " relevant chunks across " + srcs.size() + " files");
+            Thread.sleep(200);
+            List<String> sl = new ArrayList<>(srcs);
+            if (!sl.isEmpty()) {
+                StringBuilder sb = new StringBuilder();
+                for (int i = 0; i < Math.min(5, sl.size()); i++) {
+                    if (i > 0) sb.append(", ");
+                    String s = sl.get(i); int slash = s.lastIndexOf('/');
+                    sb.append(slash >= 0 ? s.substring(slash + 1) : s);
+                }
+                if (sl.size() > 5) sb.append(" +").append(sl.size() - 5).append(" more");
+                sendEvent(emitter, "thought", sb.toString());
+            }
+            Thread.sleep(200);
+            emitter.send(SseEmitter.event().data("{\"type\":\"thought_done\"}"));
+        } catch (Exception e) { /* ignore */ }
+    }
+
     private void emitEvidence(SseEmitter emitter, String baseUrl, Map<String, List<String>> grouped) {
         List<String> srcs = new ArrayList<>(grouped.keySet());
         if (srcs.isEmpty()) return;
-        StringBuilder ev = new StringBuilder("\n\nEVIDENCE:\n");
-        for (int i=0; i<Math.min(8,srcs.size()); i++)
+        StringBuilder ev = new StringBuilder();
+        for (int i = 0; i < Math.min(8, srcs.size()); i++)
             ev.append("- [").append(srcs.get(i)).append("](")
               .append(baseUrl).append(srcs.get(i)).append(")\n");
         try {
-            emitter.send(SseEmitter.event().data(jsonEvent("response",ev.toString())));
-        } catch (IOException e) { /* ignore */ }
+            sendEvent(emitter, "evidence", ev.toString());
+        } catch (Exception e) { /* ignore */ }
     }
 
-    private String formatHistory(int max) {
-        if (chatHistory.isEmpty()) return "(none)";
-        int s = Math.max(0,chatHistory.size()-max);
-        StringBuilder sb = new StringBuilder();
-        for (int i=s; i<chatHistory.size(); i++)
-            sb.append(chatHistory.get(i).get("role")).append(": ")
-              .append(chatHistory.get(i).get("content")).append("\n");
-        return sb.toString();
-    }
-
-    private static String jsonEvent(String type, String content) {
-        return "{\"type\":\""+type+"\",\"content\":\""+
-                content.replace("\\","\\\\").replace("\"","\\\"").replace("\n","\\n")+"\"}";
-    }
-
-    private static String qPreview(String q) {
-        return q.length()>60 ? q.substring(0,60)+"..." : q;
-    }
+    // ── History (from SQLite, for UI) ──
 
     public List<Map<String, String>> getChatHistory(String slug) {
         return historyStore.getHistory(slug != null ? slug : repoSlug);
     }
 
     public Map<String, Object> getStats() { return new LinkedHashMap<>(analysisStats); }
+
+    // ── Utils ──
+
+    private static String qPreview(String q) {
+        return q.length() > 60 ? q.substring(0, 60) + "..." : q;
+    }
 }

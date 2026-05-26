@@ -21,7 +21,11 @@ import java.util.Map;
 public class AnalyzeController {
 
     private final GitLoaderService gitLoader = new GitLoaderService();
-    private final RagService ragService = new RagService(); // 简化：单实例
+    private final RagService ragService;
+
+    public AnalyzeController(RagService ragService) {
+        this.ragService = ragService;
+    }
 
     /**
      * POST /api/analyze
