@@ -160,7 +160,7 @@ public class AdvancedRetriever {
 
     private Map<Integer, Double> bm25Search(String query, int limit) {
         Map<Integer, Double> scores = new LinkedHashMap<>();
-        String[] words = query.toLowerCase().split("[\\s,.!?;:，。！？；：]+");
+        String[] words = tokenize(query.toLowerCase());
 
         for (int i = 0; i < bm25Texts.size(); i++) {
             String text = bm25Texts.get(i).toLowerCase();
@@ -174,5 +174,58 @@ public class AdvancedRetriever {
             if (score > 0) scores.put(i, score);
         }
         return scores;
+    }
+
+    /**
+     * 中英文混合分词：中文用字符二元组(bigram)，英文用空格/标点切分
+     */
+    private String[] tokenize(String text) {
+        List<String> tokens = new ArrayList<>();
+        StringBuilder buf = new StringBuilder();
+        boolean inCJK = false;
+
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            boolean isCJK = Character.isIdeographic(c);
+
+            if (isCJK != inCJK) {
+                if (buf.length() > 0) {
+                    if (inCJK) {
+                        addBigrams(tokens, buf.toString());
+                    } else {
+                        addWordTokens(tokens, buf.toString());
+                    }
+                    buf.setLength(0);
+                }
+                inCJK = isCJK;
+            }
+            buf.append(c);
+        }
+        if (buf.length() > 0) {
+            if (inCJK) {
+                addBigrams(tokens, buf.toString());
+            } else {
+                addWordTokens(tokens, buf.toString());
+            }
+        }
+        return tokens.toArray(new String[0]);
+    }
+
+    private void addBigrams(List<String> tokens, String cjk) {
+        for (int i = 0; i < cjk.length() - 1; i++) {
+            tokens.add(cjk.substring(i, i + 2));
+        }
+        // Also add single characters for short queries
+        if (cjk.length() <= 4) {
+            for (int i = 0; i < cjk.length(); i++) {
+                tokens.add(String.valueOf(cjk.charAt(i)));
+            }
+        }
+    }
+
+    private void addWordTokens(List<String> tokens, String nonCjk) {
+        for (String w : nonCjk.split("[\\s,.!?;:()\\[\\]{}=+&|<>/\\\\@#$%^&*_\"'`~-]+")) {
+            if (!w.isEmpty()) tokens.add(w);
+        }
     }
 }
